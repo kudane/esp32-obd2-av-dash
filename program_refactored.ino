@@ -38,11 +38,10 @@ ESP_8_BIT_GFX videoOut(true, 8);
 // Cached telemetry
 // =========================================================
 struct ObdData {
-  int rpm = 0;
-  int map = 0;
+  int distance = 0; // Changed from RPM to Distance (PID 0x31)
   int clt = 0;
   int iat = 0;
-  float tps = 0.0f;
+  float engineLoad = 0.0f; // Changed from fuelRate to engineLoad
   float battery = 0.0f;
 };
 
@@ -63,29 +62,26 @@ volatile uint32_t connectedAt = 0;
 // =========================================================
 // OBD PID scheduler
 // =========================================================
-// RPM and TPS are sampled more often than slow-changing values.
+// Engine Load is sampled more often than slow-changing values.
 // Sequence:
-//   RPM -> TPS -> RPM -> MAP -> RPM -> CLT -> RPM -> IAT -> RPM -> BAT
-// This keeps the dashboard responsive without issuing concurrent PID requests.
+//   EngineLoad -> Distance -> EngineLoad -> Clt -> EngineLoad -> Iat -> EngineLoad -> Battery
+// This keeps the dashboard responsive for throttle changes.
 enum class Pid : uint8_t {
-  Rpm,
-  Tps,
-  Map,
+  Distance,
+  EngineLoad,
   Clt,
   Iat,
   Battery
 };
 
 constexpr Pid PID_SEQUENCE[] = {
-  Pid::Rpm,
-  Pid::Tps,
-  Pid::Rpm,
-  Pid::Map,
-  Pid::Rpm,
+  Pid::EngineLoad,
+  Pid::Distance,
+  Pid::EngineLoad,
   Pid::Clt,
-  Pid::Rpm,
+  Pid::EngineLoad,
   Pid::Iat,
-  Pid::Rpm,
+  Pid::EngineLoad,
   Pid::Battery
 };
 
@@ -180,12 +176,12 @@ void drawMitsubishiLogo() {
   if (!isConnected()) {
     strcpy(baseText, "Connecting OBDII");
 
-    const int dotCount = (millis() / 500) % 4;
-    for (int i = 0; i < dotCount; ++i) {
-      strcat(baseText, ".");
-    }
+    // const int dotCount = (millis() / 500) % 4;
+    // for (int i = 0; i < dotCount; ++i) {
+    //   strcat(baseText, ".");
+    // }
   } else {
-    strcpy(baseText, "Connected! Waiting...");
+    strcpy(baseText, "Connected! Waiting");
   }
 
   const int maxTextWidth = strlen(baseText) * 6;
@@ -218,11 +214,10 @@ void renderDataScreen() {
   const int row2 = (videoOut.height() / 3) + 15;
   const int row3 = ((videoOut.height() / 3) * 2) + 15;
 
-  char rpmStr[16];
-  char mapStr[16];
+  char distStr[16]; 
   char cltStr[16];
   char iatStr[16];
-  char tpsStr[16];
+  char loadStr[16]; 
   char batStr[16];
 
   // Snapshot the cache once so one rendered frame does not mix values
@@ -232,19 +227,39 @@ void renderDataScreen() {
   snapshot = obdData;
   portEXIT_CRITICAL(&telemetryMux);
 
-  snprintf(rpmStr, sizeof(rpmStr), "%d", snapshot.rpm);
-  snprintf(mapStr, sizeof(mapStr), "%d", snapshot.map);
+  // Format data into strings
+  snprintf(distStr, sizeof(distStr), "%d", snapshot.distance);
   snprintf(cltStr, sizeof(cltStr), "%d", snapshot.clt);
   snprintf(iatStr, sizeof(iatStr), "%d", snapshot.iat);
-  snprintf(tpsStr, sizeof(tpsStr), "%.1f", snapshot.tps);
+  snprintf(loadStr, sizeof(loadStr), "%.1f", snapshot.engineLoad);
   snprintf(batStr, sizeof(batStr), "%.1f", snapshot.battery);
 
-  drawDataCell(col1, row1, "Engine Speed", rpmStr, "rpm");
+  // Draw cells
+  drawDataCell(col1, row1, "Distance", distStr, "km");
   drawDataCell(col2, row1, "Intake Air", iatStr, "C");
-  drawDataCell(col1, row2, "Throttle", tpsStr, "%");
+  drawDataCell(col1, row2, "Engine Load", loadStr, "%");
   drawDataCell(col2, row2, "Coolant", cltStr, "C");
-  drawDataCell(col1, row3, "Battery", batStr, "V");
-  drawDataCell(col2, row3, "Manifold", mapStr, "kPa");
+  drawDataCell(col1, row3, "ECU Voltage", batStr, "V");
+  
+  // Custom draw for Fuel Type (Fixed text with red color for G95)
+  // Instead of using drawDataCell for this specific cell, we draw it manually.
+  
+  // 1. Draw Label
+  videoOut.setTextSize(1);
+  videoOut.setTextColor(255); // Default color (assuming white/bright for 8-bit palette, 255 usually is white, adjust if needed)
+  videoOut.setCursor(col2, row3);
+  videoOut.print("Fuel Type");
+
+  // 2. Draw Value ("G95") in RED
+  videoOut.setTextSize(3);
+  // Using 8-bit color palette (RRRGGGBB format generally, Red = 0xE0 or similar depending on exact library setup)
+  // 0xE0 is 11100000 in binary (Red=111, Green=000, Blue=00)
+  videoOut.setTextColor(0xE0); 
+  videoOut.setCursor(col2, row3 + 12);
+  videoOut.print("G95");
+  
+  // Reset text color back to default for the next frame
+  videoOut.setTextColor(255); 
 }
 
 void updateVideo() {
@@ -263,33 +278,23 @@ void updateVideo() {
 // =========================================================
 bool readPid(Pid pid) {
   switch (pid) {
-    case Pid::Rpm: {
-      const float value = elm->rpm();
+    case Pid::Distance: {
+      // elm->distSinceCodesCleared() is PID 0x31 (Mode 01)
+      const int value = static_cast<int>(elm->distSinceCodesCleared());
       if (elm->nb_rx_state == ELM_SUCCESS) {
         portENTER_CRITICAL(&telemetryMux);
-        obdData.rpm = static_cast<int>(value);
+        obdData.distance = value;
         portEXIT_CRITICAL(&telemetryMux);
         return true;
       }
       break;
     }
 
-    case Pid::Tps: {
-      const float value = elm->throttle();
+    case Pid::EngineLoad: {
+      const float value = elm->engineLoad(); // PID 0x04
       if (elm->nb_rx_state == ELM_SUCCESS) {
         portENTER_CRITICAL(&telemetryMux);
-        obdData.tps = value;
-        portEXIT_CRITICAL(&telemetryMux);
-        return true;
-      }
-      break;
-    }
-
-    case Pid::Map: {
-      const int value = static_cast<int>(elm->manifoldPressure());
-      if (elm->nb_rx_state == ELM_SUCCESS) {
-        portENTER_CRITICAL(&telemetryMux);
-        obdData.map = value;
+        obdData.engineLoad = value;
         portEXIT_CRITICAL(&telemetryMux);
         return true;
       }
