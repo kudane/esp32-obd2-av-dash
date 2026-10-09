@@ -38,7 +38,7 @@ ESP_8_BIT_GFX videoOut(true, 8);
 // Cached telemetry
 // =========================================================
 struct ObdData {
-  float fuelRate = 0.0f; // Changed from speed to fuelRate (L/h)
+  uint32_t runTime = 0; // Time in seconds
   int clt = 0;
   int iat = 0;
   float engineLoad = 0.0f;
@@ -46,6 +46,16 @@ struct ObdData {
 };
 
 ObdData obdData;
+
+// =========================================================
+// Driving Alert State
+// =========================================================
+constexpr uint32_t ALERT_INTERVAL_SEC = 1800; // 30 minutes (30 * 60)
+constexpr uint32_t ALERT_DURATION_MS = 5000;  // Show alert for 5 seconds
+
+uint32_t lastAlertRunTime = 0;
+bool isAlertActive = false;
+uint32_t alertStartTimeMs = 0;
 
 // =========================================================
 // Connection / screen state
@@ -63,11 +73,8 @@ volatile uint32_t connectedAt = 0;
 // OBD PID scheduler
 // =========================================================
 // Engine Load is sampled more often than slow-changing values.
-// Sequence:
-//   EngineLoad -> FuelRate -> EngineLoad -> Clt -> EngineLoad -> Iat -> EngineLoad -> Battery
-// This keeps the dashboard responsive for throttle changes.
 enum class Pid : uint8_t {
-  FuelRate, // Changed from Speed to FuelRate
+  RunTime,
   EngineLoad,
   Clt,
   Iat,
@@ -76,7 +83,7 @@ enum class Pid : uint8_t {
 
 constexpr Pid PID_SEQUENCE[] = {
   Pid::EngineLoad,
-  Pid::FuelRate, // Changed from Speed to FuelRate
+  Pid::RunTime,
   Pid::EngineLoad,
   Pid::Clt,
   Pid::EngineLoad,
@@ -118,8 +125,6 @@ static void markDisconnected(const char* reason) {
   consecutiveObdErrors = 0;
   pidIndex = 0;
 
-  // ELMduino owns an internal payload buffer. Destroy the client so a
-  // future reconnect starts with a clean allocation.
   if (elm != nullptr) {
     delete elm;
     elm = nullptr;
@@ -127,16 +132,38 @@ static void markDisconnected(const char* reason) {
 }
 
 static bool screenReady() {
-  return isConnected() &&
-         (millis() - connectedAt >= SCREEN_READY_DELAY_MS);
+  return isConnected() && (millis() - connectedAt >= SCREEN_READY_DELAY_MS);
 }
 
 // =========================================================
 // Graphics
 // =========================================================
+void drawDriveCarefullyAlert() {
+  // Fill screen with white background
+  videoOut.fillScreen(0xFF);
+  
+  const int cx = videoOut.width() / 2;
+  const int cy = videoOut.height() / 2;
+  
+  const char* alertText = "Drive carefully.";
+  
+  // Set text color to black (0x00) for contrast against white background
+  videoOut.setTextColor(0x00);
+  videoOut.setTextSize(2);
+  
+  // Calculate text position to center it
+  // Size 2 text is approx 12 pixels wide and 16 pixels high per character
+  const int maxTextWidth = strlen(alertText) * 12;
+  videoOut.setCursor(cx - (maxTextWidth / 2), cy - 8);
+  videoOut.print(alertText);
+  
+  // Reset text color back to default white for other screens
+  videoOut.setTextColor(0xFF);
+}
+
 void drawMitsubishiLogo() {
   const int cx = videoOut.width() / 2;
-  const int cy = videoOut.height() / 2 - 20;
+  const int cy = (videoOut.height() / 2) - 20;
   const int dx = 14;
   const int dy = static_cast<int>(dx * 1.732f);
 
@@ -171,19 +198,10 @@ void drawMitsubishiLogo() {
                         0xE0);
 
   videoOut.setTextSize(1);
+  videoOut.setTextColor(0xFF); 
 
-  char baseText[32];
-  if (!isConnected()) {
-    strcpy(baseText, "Connecting OBDII");
-
-    // const int dotCount = (millis() / 500) % 4;
-    // for (int i = 0; i < dotCount; ++i) {
-    //   strcat(baseText, ".");
-    // }
-  } else {
-    strcpy(baseText, "Connected! Waiting");
-  }
-
+  // ฟังก์ชันนี้จะถูกเรียกใช้เฉพาะตอน Connecting เท่านั้น จึงไม่จำเป็นต้องเช็คสถานะอีก
+  const char* baseText = "Connecting OBDII";
   const int maxTextWidth = strlen(baseText) * 6;
   videoOut.setCursor(cx - (maxTextWidth / 2), cy + 55);
   videoOut.print(baseText);
@@ -193,6 +211,8 @@ void drawDataCell(int x, int y,
                   const char* label,
                   const char* value,
                   const char* unit) {
+  videoOut.setTextColor(0xFF); 
+  
   videoOut.setTextSize(1);
   videoOut.setCursor(x, y);
   videoOut.print(label);
@@ -214,21 +234,27 @@ void renderDataScreen() {
   const int row2 = (videoOut.height() / 3) + 15;
   const int row3 = ((videoOut.height() / 3) * 2) + 15;
 
-  char fuelRateStr[16]; // Changed from speedStr to fuelRateStr
+  char runTimeStr[16]; 
   char cltStr[16];
   char iatStr[16];
   char loadStr[16]; 
   char batStr[16];
 
   // Snapshot the cache once so one rendered frame does not mix values
-  // from multiple reads while the OBD task is updating them.
   ObdData snapshot;
   portENTER_CRITICAL(&telemetryMux);
   snapshot = obdData;
   portEXIT_CRITICAL(&telemetryMux);
 
   // Format data into strings
-  snprintf(fuelRateStr, sizeof(fuelRateStr), "%.1f", snapshot.fuelRate); // Use fuelRate
+  uint32_t rTime = snapshot.runTime;
+  uint32_t hours = rTime / 3600;
+  uint32_t minutes = (rTime % 3600) / 60;
+  // uint32_t seconds = rTime % 60; // Not needed anymore for HH:MM
+
+  // แก้ไขแสดงผลเป็น HH:MM
+  snprintf(runTimeStr, sizeof(runTimeStr), "%02u:%02u", hours, minutes);
+
   snprintf(cltStr, sizeof(cltStr), "%d", snapshot.clt);
   snprintf(iatStr, sizeof(iatStr), "%d", snapshot.iat);
   snprintf(loadStr, sizeof(loadStr), "%.1f", snapshot.engineLoad);
@@ -239,36 +265,79 @@ void renderDataScreen() {
   drawDataCell(col2, row1, "Intake Air", iatStr, "C");
   drawDataCell(col1, row2, "Engine Load", loadStr, "%");
   drawDataCell(col2, row2, "Coolant", cltStr, "C");
-  drawDataCell(col1, row3, "Fuel Rate", fuelRateStr, "L/h");
   
-  // Custom draw for Fuel Type (Fixed text with red color for G95)
-  // Instead of using drawDataCell for this specific cell, we draw it manually.
+  // Custom draw for Run Time to fit HH:MM
+  videoOut.setTextColor(0xFF);
+  videoOut.setTextSize(1);
+  videoOut.setCursor(col1, row3);
+  videoOut.print("Run Time");
+
+  // ปรับขนาดกลับมาเป็น Size 3 ได้แล้วเพราะ 00:00 (5 ตัวอักษร) ใช้พื้นที่น้อยกว่า 00:00:00
+  videoOut.setTextSize(3); 
+  videoOut.setCursor(col1, row3 + 12);
+  videoOut.print(runTimeStr);
   
+  // Custom draw for Fuel Type
   // 1. Draw Label
   videoOut.setTextSize(1);
-  videoOut.setTextColor(255); // Default color (assuming white/bright for 8-bit palette, 255 usually is white, adjust if needed)
+  videoOut.setTextColor(0xFF);
   videoOut.setCursor(col2, row3);
   videoOut.print("Fuel Type");
 
-  // 2. Draw Value ("G95") in RED
+  // 2. Draw Value ("G95") in WHITE
   videoOut.setTextSize(3);
-  // Using 8-bit color palette (RRRGGGBB format generally, Red = 0xE0 or similar depending on exact library setup)
-  // 0xE0 is 11100000 in binary (Red=111, Green=000, Blue=00)
-  videoOut.setTextColor(0xE0); 
+  videoOut.setTextColor(0xFF);
   videoOut.setCursor(col2, row3 + 12);
   videoOut.print("G95");
   
   // Reset text color back to default for the next frame
-  videoOut.setTextColor(255); 
+  videoOut.setTextColor(0xFF); 
 }
 
 void updateVideo() {
   videoOut.waitForFrame();
   videoOut.fillScreen(0x00);
 
+  // Snapshot the runTime to check for alerts
+  uint32_t currentRunTime = 0;
+  portENTER_CRITICAL(&telemetryMux);
+  currentRunTime = obdData.runTime;
+  portEXIT_CRITICAL(&telemetryMux);
+
+  const uint32_t nowMs = millis();
+
+  // Check if we should trigger a new alert
+  // Condition: Screen is ready, we haven't alerted for this 30-min block, and runTime crossed the threshold
+  if (screenReady() && currentRunTime >= ALERT_INTERVAL_SEC) {
+      uint32_t currentIntervalCount = currentRunTime / ALERT_INTERVAL_SEC;
+      uint32_t lastAlertIntervalCount = lastAlertRunTime / ALERT_INTERVAL_SEC;
+
+      if (currentIntervalCount > lastAlertIntervalCount && !isAlertActive) {
+          isAlertActive = true;
+          alertStartTimeMs = nowMs;
+          lastAlertRunTime = currentRunTime;
+      }
+  }
+
+  // Manage alert state duration
+  if (isAlertActive) {
+      if (nowMs - alertStartTimeMs < ALERT_DURATION_MS) {
+          drawDriveCarefullyAlert();
+          return; // Skip drawing other screens while alert is active
+      } else {
+          isAlertActive = false; // Alert duration finished
+      }
+  }
+
+  // Normal screen rendering
   if (screenReady()) {
     renderDataScreen();
+  } else if (isConnected()) {
+    // ช่วงที่เชื่อมต่อแล้ว แต่กำลังรอให้ครบ 5 วินาที (SCREEN_READY_DELAY_MS)
+    // แทนที่จะแสดง "Loading Data..." ให้แสดงหน้าแจ้งเตือนการขับขี่แทน
+    drawDriveCarefullyAlert();
   } else {
+    // ช่วงที่ยังไม่เชื่อมต่อ แสดงโลโก้
     drawMitsubishiLogo();
   }
 }
@@ -278,12 +347,11 @@ void updateVideo() {
 // =========================================================
 bool readPid(Pid pid) {
   switch (pid) {
-    case Pid::FuelRate: {
-      // Changed to use elm->fuelRate() which reads fuel consumption rate (PID 0x5E)
-      const float value = elm->fuelRate();
+    case Pid::RunTime: {
+      const uint32_t value = elm->runTime();
       if (elm->nb_rx_state == ELM_SUCCESS) {
         portENTER_CRITICAL(&telemetryMux);
-        obdData.fuelRate = value;
+        obdData.runTime = value;
         portEXIT_CRITICAL(&telemetryMux);
         return true;
       }
@@ -346,9 +414,6 @@ void processCurrentPid() {
 
   const Pid pid = PID_SEQUENCE[pidIndex];
 
-  // Important: call the same PID function repeatedly while
-  // ELM_GETTING_MSG is active. Do not issue a second query just
-  // to retrieve the result.
   const bool success = readPid(pid);
 
   if (success) {
@@ -386,9 +451,6 @@ void obdTask(void* parameter) {
       case ConnectionState::Connecting: {
         Serial.println("Connecting to ELM327...");
 
-        // Allocate a fresh ELMduino object for every connection attempt.
-        // If begin() fails, delete() runs ELMduino's destructor and frees
-        // its internal payload buffer before the next attempt.
         if (elm != nullptr) {
           delete elm;
           elm = nullptr;
@@ -402,8 +464,6 @@ void obdTask(void* parameter) {
           break;
         }
 
-        // ELMduino begin() can block during protocol detection.
-        // It is intentionally executed here, not inside loop().
         if (elm->begin(obdSerial, true, 1500)) {
           markConnected();
         } else {
