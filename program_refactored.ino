@@ -38,10 +38,10 @@ ESP_8_BIT_GFX videoOut(true, 8);
 // Cached telemetry
 // =========================================================
 struct ObdData {
-  int distance = 0; // Changed from RPM to Distance (PID 0x31)
+  float fuelRate = 0.0f; // Changed from speed to fuelRate (L/h)
   int clt = 0;
   int iat = 0;
-  float engineLoad = 0.0f; // Changed from fuelRate to engineLoad
+  float engineLoad = 0.0f;
   float battery = 0.0f;
 };
 
@@ -64,10 +64,10 @@ volatile uint32_t connectedAt = 0;
 // =========================================================
 // Engine Load is sampled more often than slow-changing values.
 // Sequence:
-//   EngineLoad -> Distance -> EngineLoad -> Clt -> EngineLoad -> Iat -> EngineLoad -> Battery
+//   EngineLoad -> FuelRate -> EngineLoad -> Clt -> EngineLoad -> Iat -> EngineLoad -> Battery
 // This keeps the dashboard responsive for throttle changes.
 enum class Pid : uint8_t {
-  Distance,
+  FuelRate, // Changed from Speed to FuelRate
   EngineLoad,
   Clt,
   Iat,
@@ -76,7 +76,7 @@ enum class Pid : uint8_t {
 
 constexpr Pid PID_SEQUENCE[] = {
   Pid::EngineLoad,
-  Pid::Distance,
+  Pid::FuelRate, // Changed from Speed to FuelRate
   Pid::EngineLoad,
   Pid::Clt,
   Pid::EngineLoad,
@@ -214,7 +214,7 @@ void renderDataScreen() {
   const int row2 = (videoOut.height() / 3) + 15;
   const int row3 = ((videoOut.height() / 3) * 2) + 15;
 
-  char distStr[16]; 
+  char fuelRateStr[16]; // Changed from speedStr to fuelRateStr
   char cltStr[16];
   char iatStr[16];
   char loadStr[16]; 
@@ -228,18 +228,18 @@ void renderDataScreen() {
   portEXIT_CRITICAL(&telemetryMux);
 
   // Format data into strings
-  snprintf(distStr, sizeof(distStr), "%d", snapshot.distance);
+  snprintf(fuelRateStr, sizeof(fuelRateStr), "%.1f", snapshot.fuelRate); // Use fuelRate
   snprintf(cltStr, sizeof(cltStr), "%d", snapshot.clt);
   snprintf(iatStr, sizeof(iatStr), "%d", snapshot.iat);
   snprintf(loadStr, sizeof(loadStr), "%.1f", snapshot.engineLoad);
   snprintf(batStr, sizeof(batStr), "%.1f", snapshot.battery);
 
   // Draw cells
-  drawDataCell(col1, row1, "Distance", distStr, "km");
+  drawDataCell(col1, row1, "ECU Voltage", batStr, "V");
   drawDataCell(col2, row1, "Intake Air", iatStr, "C");
   drawDataCell(col1, row2, "Engine Load", loadStr, "%");
   drawDataCell(col2, row2, "Coolant", cltStr, "C");
-  drawDataCell(col1, row3, "ECU Voltage", batStr, "V");
+  drawDataCell(col1, row3, "Fuel Rate", fuelRateStr, "L/h");
   
   // Custom draw for Fuel Type (Fixed text with red color for G95)
   // Instead of using drawDataCell for this specific cell, we draw it manually.
@@ -278,12 +278,12 @@ void updateVideo() {
 // =========================================================
 bool readPid(Pid pid) {
   switch (pid) {
-    case Pid::Distance: {
-      // elm->distSinceCodesCleared() is PID 0x31 (Mode 01)
-      const int value = static_cast<int>(elm->distSinceCodesCleared());
+    case Pid::FuelRate: {
+      // Changed to use elm->fuelRate() which reads fuel consumption rate (PID 0x5E)
+      const float value = elm->fuelRate();
       if (elm->nb_rx_state == ELM_SUCCESS) {
         portENTER_CRITICAL(&telemetryMux);
-        obdData.distance = value;
+        obdData.fuelRate = value;
         portEXIT_CRITICAL(&telemetryMux);
         return true;
       }
